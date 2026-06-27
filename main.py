@@ -11,6 +11,7 @@ import os
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import collector
+import local_collector
 import processor
 import digest_builder
 import delivery
@@ -21,8 +22,11 @@ def run_full(period="morning"):
     print("📡 信息精选系统 v2.0")
     print("=" * 50)
 
-    print("\n🔄 Step 1: 采集...")
+    print("\n🔄 Step 1a: 在线采集...")
     n = collector.collect_all()
+
+    print("\n📁 Step 1b: 本地文件...")
+    n2 = local_collector.collect_inbox()
 
     print("\n🤖 Step 2: AI 处理（两阶段）...")
     n = processor.process_unsummarized(limit=50)
