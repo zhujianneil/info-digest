@@ -1,0 +1,6 @@
+digest.db
+logs/
+sources/*.md
+__pycache__/
+*.pyc
+.env
