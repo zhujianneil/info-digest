@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Pre-commit hook: 强制所有 .py 里 SQLite DDL/DML 表名加 digest_ 前缀.
+
+保护对象: 5 张表 — sources / content / summaries / digests / feedback.
+只要新增 .py 的某一行含这几个表名 (但没带 digest_ 前缀), 拒绝 commit.
+
+允许例外:
+  - 迁移脚本 migrate_add_prefix.py (迁移必然涉及老名)
+  - 注释行 (以井号或三引号开头)
+  - 字符串里说'无前缀'的元数据/TODO (会经过人审)
+  - 出现在迁移脚本 + 这 hook 自己
+"""
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# 表名白名单 + 允许出现的非前缀形式
+TABLES = ["sources", "content", "summaries", "digests", "feedback"]
+# 拼一个正则: \b(sources|content|summaries|digests|feedback)\b 且前面不是 digest_
+TABLE_RE = re.compile(r"(?<!digest_)\b(" + "|".join(TABLES) + r")\b")
+
+# 这文件自己 + migration 脚本允许出现
+ALLOWLIST = {
+    ".githooks/pre-commit",
+    "migrate_add_prefix.py",
+}
+
+# 排除注释行
+COMMENT_RE = re.compile(r"^\s*(#|\"\"\")")
+
+
+def is_sql_context(line: str) -> bool:
+    """判断这一行是不是在 SQL 上下文中."""
+    keywords = ["FROM", "INTO", "UPDATE", "JOIN", "DELETE FROM", "TRUNCATE",
+                "ALTER TABLE", "DROP TABLE", "CREATE TABLE", "RENAME",
+                "INSERT INTO"]
+    return any(k in line for k in keywords) or "conn.execute(" in line or "execute(" in line
+
+
+def main():
+    p = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
+                       capture_output=True, text=True, cwd=".")
+    files = [f for f in p.stdout.splitlines() if f.endswith(".py")]
+
+    if not files:
+        return 0
+
+    violations = []
+    for f in files:
+        if f in ALLOWLIST:
+            continue
+        path = Path(f)
+        if not path.exists():
+            continue
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if COMMENT_RE.match(line):
+                continue
+            # 字符串里显式说"应加前缀"或"老 prefix"的不算 (含 explanation)
+            if "应加" in line or "应不存" in line or "应消失" in line:
+                continue
+            if is_sql_context(line):
+                m = TABLE_RE.search(line)
+                if m:
+                    violations.append((f, lineno, line.strip(), m.group(0)))
+
+    if violations:
+        print("⛔ pre-commit: 检测到未加 digest_ 前缀的 SQL 表名\n")
+        for f, n, l, t in violations:
+            print(f"  {f}:{n}  → 表 '{t}'")
+            print(f"    | {l}")
+        print(f"\n💡 修复: 把 SQL 表名加 'digest_' 前缀,例如:")
+        print(f"    SELECT * FROM sources   →   SELECT * FROM digest_sources")
+        print(f"\n如确实需要例外 (迁移/临时 SQL), 在 {__file__} 的 ALLOWLIST 加白名单.")
+        return 1
+
+    print(f"✅ {len(files)} 个 python 文件无未加前缀的 SQL.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
