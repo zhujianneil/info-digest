@@ -1,10 +1,10 @@
--- 信息精选系统 v1
--- 理念：让每一分钟的信息消费都有回报
+-- 信息精选系统 v1 (嵌入 investment-monitor)
+-- 共享 monitor.db;所有表加 digest_ 前缀避免冲突
 
 -- ============================================================
 -- 1. 信息源
 -- ============================================================
-CREATE TABLE IF NOT EXISTS sources (
+CREATE TABLE IF NOT EXISTS digest_sources (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,                    -- 段永平雪球、张一鸣播客...
     url         TEXT,                             -- 主页/RSS地址
@@ -22,9 +22,9 @@ CREATE TABLE IF NOT EXISTS sources (
 -- ============================================================
 -- 2. 原始内容
 -- ============================================================
-CREATE TABLE IF NOT EXISTS content (
+CREATE TABLE IF NOT EXISTS digest_content (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id   INTEGER NOT NULL REFERENCES sources(id),
+    source_id   INTEGER NOT NULL REFERENCES digest_sources(id),
     external_id TEXT,                             -- 原平台唯一ID（防重）
     title       TEXT,
     url         TEXT,                             -- 原文链接
@@ -42,17 +42,15 @@ CREATE TABLE IF NOT EXISTS content (
 -- ============================================================
 -- 3. AI 处理结果
 -- ============================================================
-CREATE TABLE IF NOT EXISTS summaries (
+CREATE TABLE IF NOT EXISTS digest_summaries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id  INTEGER NOT NULL REFERENCES content(id),
+    content_id  INTEGER NOT NULL REFERENCES digest_content(id),
     model       TEXT,                             -- 用了哪个模型
-    -- 核心输出
     one_liner   TEXT NOT NULL,                    -- 一句话概括（30字内）
     key_points  TEXT NOT NULL,                    -- 核心要点 JSON数组
     insight     TEXT,                             -- AI提取的洞察/金句
     category    TEXT,                             -- 投资/产品/管理/行业/科技
     quality_score REAL DEFAULT 0,                 -- 质量评分 0-10
-    -- 元数据
     tokens_used INTEGER,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(content_id)
@@ -61,7 +59,7 @@ CREATE TABLE IF NOT EXISTS summaries (
 -- ============================================================
 -- 4. 每日Digest
 -- ============================================================
-CREATE TABLE IF NOT EXISTS digests (
+CREATE TABLE IF NOT EXISTS digest_digests (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     digest_date TEXT NOT NULL,                    -- YYYY-MM-DD
     period      TEXT NOT NULL,                    -- morning / evening
@@ -79,8 +77,8 @@ CREATE TABLE IF NOT EXISTS digests (
 -- ============================================================
 CREATE TABLE IF NOT EXISTS digest_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    digest_id   INTEGER NOT NULL REFERENCES digests(id),
-    summary_id  INTEGER NOT NULL REFERENCES summaries(id),
+    digest_id   INTEGER NOT NULL REFERENCES digest_digests(id),
+    summary_id  INTEGER NOT NULL REFERENCES digest_summaries(id),
     position    INTEGER NOT NULL DEFAULT 0,       -- 排序位置
     included    INTEGER NOT NULL DEFAULT 1,       -- 是否最终入选
     reason      TEXT,                             -- 为什么选/不选
@@ -90,22 +88,22 @@ CREATE TABLE IF NOT EXISTS digest_items (
 -- ============================================================
 -- 6. 用户反馈
 -- ============================================================
-CREATE TABLE IF NOT EXISTS feedback (
+CREATE TABLE IF NOT EXISTS digest_feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id  INTEGER NOT NULL REFERENCES content(id),
+    content_id  INTEGER NOT NULL REFERENCES digest_content(id),
     rating      INTEGER NOT NULL,                 -- 1=有用, -1=无用, 0=跳过
     comment     TEXT,                             -- 可选备注
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(content_id)                            -- 每条内容只评一次（可更新）
+    UNIQUE(content_id)
 );
 
 -- ============================================================
 -- 索引
 -- ============================================================
-CREATE INDEX IF NOT EXISTS idx_content_source ON content(source_id);
-CREATE INDEX IF NOT EXISTS idx_content_published ON content(published_at);
-CREATE INDEX IF NOT EXISTS idx_content_fetched ON content(fetched_at);
-CREATE INDEX IF NOT EXISTS idx_summaries_quality ON summaries(quality_score DESC);
-CREATE INDEX IF NOT EXISTS idx_summaries_category ON summaries(category);
-CREATE INDEX IF NOT EXISTS idx_digests_date ON digests(digest_date);
-CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
+CREATE INDEX IF NOT EXISTS idx_digest_content_source ON digest_content(source_id);
+CREATE INDEX IF NOT EXISTS idx_digest_content_published ON digest_content(published_at);
+CREATE INDEX IF NOT EXISTS idx_digest_content_fetched ON digest_content(fetched_at);
+CREATE INDEX IF NOT EXISTS idx_digest_summaries_quality ON digest_summaries(quality_score DESC);
+CREATE INDEX IF NOT EXISTS idx_digest_summaries_category ON digest_summaries(category);
+CREATE INDEX IF NOT EXISTS idx_digest_digests_date ON digest_digests(digest_date);
+CREATE INDEX IF NOT EXISTS idx_digest_feedback_rating ON digest_feedback(rating);

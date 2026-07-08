@@ -1,4 +1,4 @@
-"""信息精选系统 - 数据库操作"""
+"""信息精选系统 - 数据库操作 (共享 investment-monitor 的 monitor.db,表加 digest_ 前缀)"""
 import sqlite3
 import json
 from datetime import datetime, timedelta
@@ -15,7 +15,7 @@ def get_db():
 
 def get_active_sources(conn):
     """获取所有启用的信息源"""
-    cur = conn.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY tier, id")
+    cur = conn.execute("SELECT * FROM digest_sources WHERE enabled=1 ORDER BY tier, id")
     return [dict(row) for row in cur.fetchall()]
 
 
@@ -27,7 +27,7 @@ def upsert_content(conn, source_id, external_id, title, url, author, content,
 
     try:
         conn.execute("""
-            INSERT INTO content (source_id, external_id, title, url, author, content,
+            INSERT INTO digest_content (source_id, external_id, title, url, author, content,
                                 content_type, published_at, fetched_at, word_count, tags)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (source_id, external_id, title, url, author, content,
@@ -46,7 +46,7 @@ def save_summary(conn, content_id, model, one_liner, key_points, insight,
     now = datetime.utcnow().isoformat()
     try:
         conn.execute("""
-            INSERT INTO summaries (content_id, model, one_liner, key_points, insight,
+            INSERT INTO digest_summaries (content_id, model, one_liner, key_points, insight,
                                    category, quality_score, tokens_used, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (content_id, model, one_liner, kp_json, insight,
@@ -60,13 +60,13 @@ def save_summary(conn, content_id, model, one_liner, key_points, insight,
 def get_unsummarized_content(conn, limit=20):
     """获取尚未 AI 处理的内容"""
     cur = conn.execute("""
-        SELECT c.* FROM content c
-        LEFT JOIN summaries s ON c.id = s.content_id
+        SELECT c.* FROM digest_content c
+        LEFT JOIN digest_summaries s ON c.id = s.content_id
         WHERE s.id IS NULL
         ORDER BY c.fetched_at DESC
         LIMIT ?
     """, (limit,))
-    return [dict(row) for row in cur.fetchall()]
+    return [dict(row) for row in cur.fetchall()]\
 
 
 def get_digest_candidates(conn, max_items=8, quality_threshold=5.0, dedup_hours=48):
@@ -74,9 +74,9 @@ def get_digest_candidates(conn, max_items=8, quality_threshold=5.0, dedup_hours=
     cutoff = (datetime.utcnow() - timedelta(hours=dedup_hours)).isoformat()
     cur = conn.execute("""
         SELECT s.*, c.title, c.url, c.author, c.source_id, src.name as source_name
-        FROM summaries s
-        JOIN content c ON s.content_id = c.id
-        JOIN sources src ON c.source_id = src.id
+        FROM digest_summaries s
+        JOIN digest_content c ON s.content_id = c.id
+        JOIN digest_sources src ON c.source_id = src.id
         LEFT JOIN digest_items di ON s.id = di.summary_id
         WHERE s.quality_score >= ?
           AND di.id IS NULL
@@ -92,7 +92,7 @@ def create_digest(conn, digest_date, period, title, body, item_count, channel="f
     now = datetime.utcnow().isoformat()
     try:
         conn.execute("""
-            INSERT INTO digests (digest_date, period, title, body, item_count, sent_at, channel, created_at)
+            INSERT INTO digest_digests (digest_date, period, title, body, item_count, sent_at, channel, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (digest_date, period, title, body, item_count, now, channel, now))
         conn.commit()
@@ -113,5 +113,5 @@ def add_digest_item(conn, digest_id, summary_id, position, included=True, reason
 def update_source_fetched(conn, source_id):
     """更新信息源的最后抓取时间"""
     now = datetime.utcnow().isoformat()
-    conn.execute("UPDATE sources SET last_fetched_at=? WHERE id=?", (now, source_id))
+    conn.execute("UPDATE digest_sources SET last_fetched_at=? WHERE id=?", (now, source_id))
     conn.commit()
