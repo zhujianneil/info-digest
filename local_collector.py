@@ -1,25 +1,71 @@
-"""信息精选系统 - 本地文件采集
-扫描 inbox/ 目录，自动处理新文件。
-支持：.md .txt .pdf .docx .html .json
-处理完移到 processed/"""
+"""信息精选系统 - 本地采集 (知识库 git pull + 扫描 + inbox)
+
+支持：
+  - knowledge-bases/ 目录: git pull 同步 + 递归扫描所有 .md
+  - inbox/ 目录: 丢文件进去 (md/txt/pdf/docx/html/json/org)
+  - 处理完移到 processed/
+
+2026-06-27 嵌入 investment-monitor 改造:
+  - 知识库路径通过环境变量 INFO_DIGEST_KB_ROOT 配置,默认 ./knowledge-bases
+  - 每个知识库目录首次使用时自动 git pull (需要 ~/.git-credentials)
+  - 知识库 vs inbox 用不同 source_name,方便过滤
+"""
 import os
 import re
 import json
 import hashlib
 import shutil
-from datetime import datetime
+import subprocess
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import db
 import config
 
+# CST 时区用于"今/昨"判定 (知识库是长内容,不靠 fetched_at)
+CST = timezone(timedelta(hours=8))
+
 INBOX_DIR = config.PROJECT_DIR / "inbox"
 PROCESSED_DIR = config.PROJECT_DIR / "processed"
+
+# 知识库根目录:环境变量优先,默认 ./knowledge-bases
+KB_ROOT = Path(os.environ.get("INFO_DIGEST_KB_ROOT", str(config.PROJECT_DIR / "knowledge-bases")))
+
+SUPPORTED_EXT = {'.md', '.txt', '.pdf', '.docx', '.html', '.htm', '.json', '.org'}
+
+# 排除的目录 (Obsidian 索引 / git 内部)
+EXCLUDE_DIRS = {'.git', '.obsidian', 'processed', 'inbox', '.trash', 'attachments'}
 
 # 确保目录存在
 INBOX_DIR.mkdir(exist_ok=True)
 PROCESSED_DIR.mkdir(exist_ok=True)
 
-SUPPORTED_EXT = {'.md', '.txt', '.pdf', '.docx', '.html', '.htm', '.json', '.org'}
+
+# ============================================================
+#  工具函数
+# ============================================================
+
+def _git_pull(repo_dir: Path) -> bool:
+    """对单个知识库仓库 git pull. 依赖 ~/.git-credentials (credential.helper=store)"""
+    if not (repo_dir / ".git").exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if result.returncode == 0:
+            print(f"    [git pull OK] {repo_dir.name}: {result.stdout.strip()[:120]}")
+            return True
+        else:
+            print(f"    [git pull ERR] {repo_dir.name}: {result.stderr.strip()[:200]}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"    [git pull TIMEOUT] {repo_dir.name}")
+        return False
+    except Exception as e:
+        print(f"    [git pull ERR] {repo_dir.name}: {e}")
+        return False
 
 
 def _extract_text(filepath: Path) -> str:
@@ -39,7 +85,7 @@ def _extract_text(filepath: Path) -> str:
 
     if ext == '.pdf':
         try:
-            import pymupdf  # PyMuPDF
+            import pymupdf
             doc = pymupdf.open(str(filepath))
             text = ''
             for page in doc:
@@ -47,7 +93,6 @@ def _extract_text(filepath: Path) -> str:
             doc.close()
             return text
         except ImportError:
-            # fallback: try pdfplumber
             try:
                 import pdfplumber
                 with pdfplumber.open(str(filepath)) as pdf:
@@ -61,7 +106,7 @@ def _extract_text(filepath: Path) -> str:
             doc = docx.Document(str(filepath))
             return '\n'.join(p.text for p in doc.paragraphs)
         except ImportError:
-            return f"[DOCX 文件，需要安装 python-docx: pip install python-docx]"
+            return f"[DOCX 文件，需要安装 python-docx]"
 
     if ext == '.json':
         data = json.loads(filepath.read_text(encoding='utf-8'))
@@ -81,7 +126,6 @@ def _parse_sections(text: str) -> list:
     if '---' in text:
         sections = re.split(r'\n-{3,}\n', text)
     elif '\n## ' in text:
-        # 按二级标题拆分
         sections = re.split(r'\n(?=## )', text)
     else:
         sections = [text]
@@ -92,7 +136,6 @@ def _parse_sections(text: str) -> list:
         if len(section) < 30:
             continue
         lines = section.split('\n')
-        # 提取标题
         title = ''
         body_start = 0
         for i, line in enumerate(lines):
@@ -110,29 +153,125 @@ def _parse_sections(text: str) -> list:
     return items
 
 
-def collect_inbox(source_id=None):
-    """扫描 inbox/ 目录，采集新文件"""
+def _ensure_source(name: str, platform: str, fetch_method: str, fetch_config: str = "{}") -> int:
+    """确保 source 存在,返回 id"""
+    conn = db.get_db()
+    row = conn.execute(f"SELECT id FROM {config.__dict__.get('TABLE_PREFIX', 'digest_')}sources WHERE name=?", (name,)).fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    conn.execute(
+        f"INSERT INTO {config.__dict__.get('TABLE_PREFIX', 'digest_')}sources (name, tier, type, platform, fetch_method, fetch_config) VALUES (?, 1, '本地', ?, ?, ?)",
+        (name, platform, fetch_method, fetch_config),
+    )
+    conn.commit()
+    new_id = conn.execute(f"SELECT id FROM {config.__dict__.get('TABLE_PREFIX', 'digest_')}sources WHERE name=?", (name,)).fetchone()[0]
+    conn.close()
+    return new_id
+
+
+def _ingest_file(filepath: Path, source_id: int, source_name: str, source_label: str = "knowledge") -> int:
+    """把单个文件入库 (按 --- 或 ## 拆条). source_label 用于标记 url 区别"""
+    try:
+        text = _extract_text(filepath)
+        if not text or len(text) < 30:
+            return 0
+        sections = _parse_sections(text)
+        count = 0
+        conn = db.get_db()
+        for section in sections:
+            ext_id = hashlib.md5(
+                (str(filepath) + section['title']).encode()
+            ).hexdigest()[:16]
+            # 用 file:// + label 区分,知识库和 inbox 的 url scheme 一致但带 source name
+            url = f"file://{source_label}/{filepath}"
+            ok = db.upsert_content(
+                conn, source_id, ext_id,
+                title=section['title'],
+                url=url,
+                author=source_name,
+                content=section['content'][:8000],
+                content_type='text',
+                published_at=datetime.fromtimestamp(filepath.stat().st_mtime, tz=CST).isoformat(),
+                word_count=len(section['content']),
+            )
+            if ok:
+                count += 1
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"    [ERR ingest] {filepath.name}: {e}")
+        return 0
+
+
+# ============================================================
+#  知识库扫描 (git pull + 递归 ingest)
+# ============================================================
+
+def collect_knowledge_bases():
+    """扫 KB_ROOT 下所有 git repo,git pull + 递归 ingest 所有 md 文件"""
+    if not KB_ROOT.exists():
+        print(f"  [KB] KB_ROOT 不存在: {KB_ROOT}")
+        return 0
+
+    # 找直接子目录 (一个 repo 一个子目录)
+    repos = [d for d in KB_ROOT.iterdir() if d.is_dir() and (d / ".git").exists()]
+    if not repos:
+        # 也支持单层 md 直接放 KB_ROOT
+        repos = [KB_ROOT]
+
+    total = 0
+    for repo in repos:
+        repo_name = repo.name
+        print(f"  [KB] 仓库: {repo_name}")
+
+        # git pull
+        if (repo / ".git").exists():
+            _git_pull(repo)
+
+        # 创建/取 source id
+        source_id = _ensure_source(
+            name=f"知识库:{repo_name}",
+            platform="local",
+            fetch_method="local",
+            fetch_config=json.dumps({"root": str(repo)}),
+        )
+
+        # 递归扫 md
+        md_files = [
+            f for f in repo.rglob("*.md")
+            if not any(ex in f.parts for ex in EXCLUDE_DIRS)
+        ]
+        print(f"    → {len(md_files)} 个 md 文件")
+        for i, md in enumerate(md_files):
+            if i % 20 == 0:
+                print(f"    ... 进度 {i}/{len(md_files)}", flush=True)
+            n = _ingest_file(md, source_id, f"知识库:{repo_name}", source_label="kb")
+            total += n
+
+    print(f"  [KB] 知识库采集完成: 新增 {total} 条")
+    return total
+
+
+# ============================================================
+#  Inbox 扫描 (丢文件)
+# ============================================================
+
+def collect_inbox():
+    """扫描 inbox/ 目录,采集新文件"""
     files = [f for f in INBOX_DIR.iterdir()
              if f.is_file() and f.suffix.lower() in SUPPORTED_EXT]
 
     if not files:
         return 0
 
-    # 如果没有指定 source_id，用"本地文件"源
-    if source_id is None:
-        conn = db.get_db()
-        row = conn.execute("SELECT id FROM sources WHERE name='本地文件'").fetchone()
-        if not row:
-            conn.execute("""
-                INSERT INTO sources (name, tier, type, platform, fetch_method, fetch_config)
-                VALUES ('本地文件', 1, '本地', 'local', 'local', '{}')
-            """)
-            conn.commit()
-            row = conn.execute("SELECT id FROM sources WHERE name='本地文件'").fetchone()
-        source_id = row[0]
-        conn.close()
+    source_id = _ensure_source(
+        name="inbox",
+        platform="local",
+        fetch_method="local",
+    )
 
-    print(f"  [LOCAL] inbox/ 扫描到 {len(files)} 个文件")
+    print(f"  [INBOX] 扫描到 {len(files)} 个文件")
     total = 0
     conn = db.get_db()
 
@@ -154,18 +293,17 @@ def collect_inbox(source_id=None):
                 new_id = db.upsert_content(
                     conn, source_id, ext_id,
                     title=section['title'],
-                    url=f"file://{filepath}",
+                    url=f"file://inbox/{filepath}",
                     author=filepath.stem,
                     content=section['content'][:8000],
                     content_type='text',
-                    published_at=datetime.fromtimestamp(filepath.stat().st_mtime).isoformat(),
+                    published_at=datetime.fromtimestamp(filepath.stat().st_mtime, tz=CST).isoformat(),
                     word_count=len(section['content']),
                 )
                 if new_id:
                     count += 1
 
             if count > 0:
-                # 移到 processed/
                 dest = PROCESSED_DIR / filepath.name
                 if dest.exists():
                     dest = PROCESSED_DIR / f"{filepath.stem}_{datetime.now().strftime('%H%M%S')}{filepath.suffix}"
@@ -179,9 +317,21 @@ def collect_inbox(source_id=None):
             print(f"✗ {e}")
 
     conn.close()
-    print(f"  本地采集完成: {total} 条")
+    print(f"  [INBOX] 采集完成: 新增 {total} 条")
     return total
 
 
+# ============================================================
+#  主入口
+# ============================================================
+
 if __name__ == "__main__":
-    collect_inbox()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "kb":
+        collect_knowledge_bases()
+    elif len(sys.argv) > 1 and sys.argv[1] == "inbox":
+        collect_inbox()
+    else:
+        n = collect_knowledge_bases()
+        m = collect_inbox()
+        print(f"\n总计: KB {n} 条 + Inbox {m} 条")

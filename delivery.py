@@ -1,6 +1,14 @@
-"""信息精选系统 - 推送层（飞书）"""
+"""信息精选系统 - 推送层 (飞书 app + tenant_access_token)
+
+2026-06-27 嵌入 investment-monitor 容器修正:
+  - 容器用飞书 app (FEISHU_APP_ID + FEISHU_APP_SECRET),不是 webhook
+  - 凭证在 /app/.env (跟 investment-monitor 一致)
+  - 走 im/v1/messages,receive_id_type=chat_id
+  - target chat: env FEISHU_CHAT_ID,默认 FEISHU_HOME_CHANNEL
+"""
 import json
 import time
+import os
 import requests
 import config
 
@@ -9,19 +17,20 @@ _token_cache = {"token": None, "expires": 0}
 
 
 def _get_tenant_token():
-    """获取飞书 tenant_access_token（带缓存）"""
+    """获取飞书 tenant_access_token (带缓存)"""
     now = time.time()
     if _token_cache["token"] and _token_cache["expires"] > now:
         return _token_cache["token"]
 
+    app_id = config.get_feishu_app_id()
     secret = config.get_feishu_secret()
-    if not secret:
-        print("[ERR] FEISHU_APP_SECRET not set")
+    if not app_id or not secret:
+        print("[ERR] FEISHU_APP_ID / FEISHU_APP_SECRET not set")
         return None
 
     resp = requests.post(
         f"{config.FEISHU_API_BASE}/auth/v3/tenant_access_token/internal",
-        json={"app_id": config.FEISHU_APP_ID, "app_secret": secret},
+        json={"app_id": app_id, "app_secret": secret},
         timeout=10,
     )
     data = resp.json()
@@ -35,13 +44,22 @@ def _get_tenant_token():
     return token
 
 
+def _resolve_chat_id():
+    """优先 FEISHU_CHAT_ID,fallback FEISHU_HOME_CHANNEL (investment-monitor 风格)"""
+    return config.get_feishu_chat_id()
+
+
 def send_text(text, chat_id=None):
     """发送文本消息到飞书群"""
     token = _get_tenant_token()
     if not token:
         return False
 
-    chat_id = chat_id or config.FEISHU_CHAT_ID
+    chat_id = chat_id or _resolve_chat_id()
+    if not chat_id:
+        print("[ERR] no FEISHU_CHAT_ID / FEISHU_HOME_CHANNEL")
+        return False
+
     resp = requests.post(
         f"{config.FEISHU_API_BASE}/im/v1/messages?receive_id_type=chat_id",
         headers={
@@ -64,20 +82,17 @@ def send_text(text, chat_id=None):
 
 
 def send_rich_text(title, content_lines, chat_id=None):
-    """发送富文本消息（post 类型）到飞书群"""
+    """发送富文本消息 (post 类型) 到飞书群"""
     token = _get_tenant_token()
     if not token:
         return False
 
-    chat_id = chat_id or config.FEISHU_CHAT_ID
+    chat_id = chat_id or _resolve_chat_id()
+    if not chat_id:
+        print("[ERR] no FEISHU_CHAT_ID / FEISHU_HOME_CHANNEL")
+        return False
 
-    # 构建 post 内容
-    post_content = {
-        "zh_cn": {
-            "title": title,
-            "content": content_lines,
-        }
-    }
+    post_content = {"zh_cn": {"title": title, "content": content_lines}}
 
     resp = requests.post(
         f"{config.FEISHU_API_BASE}/im/v1/messages?receive_id_type=chat_id",
@@ -101,14 +116,14 @@ def send_rich_text(title, content_lines, chat_id=None):
 
 
 def send_digest(digest):
-    """发送 Digest 到飞书（富文本格式）"""
+    """发送 Digest (走原版 markdown → post 富文本)"""
     if not digest:
         return False
 
     title = digest["title"]
     body = digest["body"]
 
-    # 解析 body 为飞书 post 格式
+    # 把 markdown body 解析成飞书 post 格式
     lines = body.split("\n")
     content_lines = []
     current_para = []
@@ -133,7 +148,11 @@ def send_digest(digest):
             text = line.strip()
             if text.startswith("📎 "):
                 url = text[2:].strip()
-                current_para.append({"tag": "a", "text": "📎 原文链接", "href": url})
+                # 飞书富文本 <a> href 不允许空格;file:// 路径含空格时降级为纯文本
+                if " " in url or "\n" in url or not (url.startswith("http://") or url.startswith("https://") or url.startswith("file://")):
+                    current_para.append({"tag": "text", "text": text})
+                else:
+                    current_para.append({"tag": "a", "text": "📎 原文链接", "href": url})
             elif text.startswith("🔑 "):
                 current_para.append({"tag": "text", "text": text[2:], "style": ["italic"]})
             elif text.startswith("💡 "):
@@ -146,17 +165,14 @@ def send_digest(digest):
     if current_para:
         content_lines.append(current_para)
 
-    # 过滤空行
     content_lines = [p for p in content_lines if p]
 
     if not content_lines:
-        # 降级为纯文本
         return send_text(body)
 
     return send_rich_text(title, content_lines)
 
 
 if __name__ == "__main__":
-    # 测试发送
-    ok = send_text("🧪 信息精选系统测试消息")
+    ok = send_text("🧪 info-digest 推送测试 (走飞书 app, 看到请忽略)")
     print(f"Result: {'OK' if ok else 'FAILED'}")
