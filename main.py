@@ -26,7 +26,9 @@ def run_full(period="morning"):
     n = collector.collect_all()
 
     print("\n📁 Step 1b: 本地文件...")
-    n2 = local_collector.collect_inbox()
+    n1b = local_collector.collect_inbox()
+    print("\n📚 Step 1c: 知识库 (git pull + 拆分入库)...")
+    n1c = local_collector.collect_knowledge_bases()
 
     print("\n🤖 Step 2: AI 处理（两阶段）...")
     n = processor.process_unsummarized(limit=50)

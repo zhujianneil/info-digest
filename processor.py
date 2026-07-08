@@ -254,11 +254,12 @@ def process_unsummarized(limit=50):
 def reprocess_all(limit=50):
     """全部重新处理"""
     conn = db.get_db()
+    # digest_ 前缀避免误删 monitor.db 里其他系统的数据
     conn.execute("DELETE FROM digest_items")
-    conn.execute("DELETE FROM digests")
-    conn.execute("DELETE FROM summaries")
+    conn.execute("DELETE FROM digest_digests")
+    conn.execute("DELETE FROM digest_summaries")
     conn.commit()
-    items = conn.execute("SELECT COUNT(*) FROM content").fetchone()[0]
+    items = conn.execute("SELECT COUNT(*) FROM digest_content").fetchone()[0] 
     conn.close()
     print(f"已清除旧摘要，{items} 条待处理")
     return process_unsummarized(limit)
